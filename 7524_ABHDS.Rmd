@@ -1,0 +1,377 @@
+---
+title: "Advanced Biostatistics for HDS Assessment"
+author: "Candidate Number 7524"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+library(tidyverse)
+library(lme4)
+library(mice)
+library(pheatmap)
+```
+
+## 1. Data Exploration and Cleaning
+
+```{r load-data, include = FALSE}
+data <- readRDS("/Users//Downloads/datasets-3/DATA.rds")
+bloods <- readRDS("/Users//Downloads/datasets-3/BLOODS.rds")
+```
+
+```{r first-look, include = FALSE}
+dim(data)
+str(data)
+head(data)
+```
+
+The study consits of two datasets collected across three sites (A, B, C). There is 12,338 children, each with between 4 and 7 annual visits (61,660 total observations). The outcome, LivingBarriers, is a self reported score (0 to 100) measuring barriers to healthy childhood living, where higher scores indicate greater barriers. Gender was only recorded at visits 3 and 5 per the study protocol, however, as time-invariant characteristic it was carried forward to all visits. Age at study entry was derived from date of birth and first visit date (range 10.6 to 16.5 years, mean 14.0). Age at entry shows a moderate negative correlation with baseline LivingBarriers (r = -0.54), suggesting older children tend to report fewer barriers. The blood dataset contains measurements of 12 biomarkers from two arrays (tx and rg) taken at visits 1 and 3, giving one row per participant (12,338 rows).
+
+```{r cleaning-explore, include = FALSE}
+summary(data$LivingBarriers)
+# minimum is -1, that shouldn't be possible on a 0-100 scale
+data %>% filter(LivingBarriers == -1)
+# single observation, site c, visit 4
+
+summary(bloods) # some variables have -1 values, some have lots of NAs
+colSums(is.na(bloods)) # rg67 stands out
+table(is.na(bloods$V1.rg67), bloods$Region) # it's all site C which didn't follow the protocol
+
+# investigatting -1
+sapply(bloods %>% select(starts_with("V1"), starts_with("V3")), function(x) sum(x == -1, na.rm = TRUE))
+table(bloods$V1.tx181 == -1, bloods$Region)
+table(bloods$V3.tx181 == -1, bloods$Region)
+# again site C 
+
+table(bloods$V1.rg9 < 0, bloods$Region)
+# looks ok 
+
+# gender only at visits 3 and 5 but doesn't change, we fill for all visits
+gender_lookup <- data %>%
+  filter(!is.na(Gender)) %>%
+  group_by(ID) %>%
+  slice(1) %>%
+  select(ID, Gender)
+nrow(gender_lookup) # all 12,338 have gender
+
+data <- data %>%
+  select(-Gender) %>%
+  left_join(gender_lookup)
+
+# age at entry
+data <- data %>%
+  group_by(ID) %>%
+  mutate(age_at_entry = as.numeric(Date[1] - DateOfBirth[1]) / 365.25) %>%
+  ungroup()
+
+# centre age so the intercept represents a child of average age 
+data$age_c <- data$age_at_entry - mean(data$age_at_entry)
+
+```
+
+Upon inspecting the data, a protocol deviation at site C was identified. The biomarker tx181 was coded as -1 for all 4,148 site C children at both visits, and rg67 was entirely missing (NA) for site C at both visits. Additionally, the rg array contains 5 biomarkers rather than the documented 6, documentin a further variable lost. A single invalid LivingBarriers value of -1 was also identified (site C, visit 4), these were recoded as NA. Negative values in rg9 were investigated but found across all regions proportionally so we decided to retain them. The site C missingness is systemic, consistent with a Missing Completely At Random (MCAR) mechanism, as it is driven by site-level protocol differences rather than participant characteristics or outcomes. <br>
+
+```{r cleaning-recode}
+data$LivingBarriers[data$LivingBarriers == -1] <- NA
+bloods$V1.tx181[bloods$Region == "C"] <- NA
+bloods$V3.tx181[bloods$Region == "C"] <- NA
+```
+
+```{r visit-explore, include = FALSE}
+# how many visits per participant?
+visit_count <- data %>% count(ID, name = "n_visits")
+table(visit_count$n_visits)
+# are visits equally spaced?
+data %>%
+  arrange(ID, Visit) %>%
+  group_by(ID) %>%
+  mutate(days_since_v1 = as.numeric(Date - Date[1])) %>%
+  group_by(Visit) %>%
+  summarise(
+    mean_days = mean(days_since_v1),
+    sd_days = sd(days_since_v1)
+  )
+# visits are approximately annual (~365 days apart, SD ~25 days)
+data_baseline <- data %>% filter(Visit == 1) %>% left_join(visit_count)
+table(data_baseline$n_visits, data_baseline$Region)
+# evenly spread across regions
+# is dropout related to baseline barriers?
+data_baseline %>%
+  group_by(n_visits) %>%
+  summarise(
+    mean_baseline = mean(LivingBarriers, na.rm = TRUE),
+    n = n()
+  )
+# kids who stay longer have HIGHER baseline barriers
+```
+
+Participants have between 4 and 7 visits, approximately annually spaced (mean interval 365 days, SD 25 days). Not all participants complete all visits: all 12,338 attend visits 1 to 4, but only 7,915 reach visit 5, 3,335 reach visit 6, and 1,058 reach visit 7. Dropout is evenly distributed across regions, but participants who remain in the study longer have higher baseline LivingBarriers scores (mean 41.2 for 4-visit participants vs 49.3 for 7-visit participants). This suggests dropout is related to the outcome, making a MCR assumption unlikely. A Missing At Random (MAR) mechanism is more plausible, which has implications for our investigating approach.
+
+## 2. RQ1: How do barriers to childhood living change over time?
+
+<br>
+
+```{r rq1-descriptive, include = FALSE}
+data %>%
+  group_by(Visit) %>%
+  summarise(
+    n = n(),
+    mean = mean(LivingBarriers, na.rm = TRUE),
+    sd = sd(LivingBarriers, na.rm = TRUE)
+  )
+```
+
+```{r rq1-figure, echo = FALSE}
+sample_ids <- sample(unique(data$ID), 500)
+
+ggplot() +
+  geom_line(data = data %>% filter(ID %in% sample_ids),
+            aes(x = Visit, y = LivingBarriers, group = ID),
+            alpha = 0.2) +
+  stat_summary(data = data, aes(x = Visit, y = LivingBarriers),
+               fun = mean, geom = "line", colour = "red", linewidth = 1) +
+  stat_summary(data = data, aes(x = Visit, y = LivingBarriers),
+               fun = mean, geom = "point", colour = "red", size = 2) +
+  scale_x_continuous(breaks = 1:7) +
+  labs(y = "Living Barriers Score", x = "Visit")
+
+```
+
+<center><b>Figure 1: Individual trajectories (grey) and mean trajectory (red).</b></center>
+
+<br> Mean LivingBarriers declines from 44.2 at visit 1 to 28.2 at visit 7, and the rate of decline appears to slow at later visits. Individual trajectories show significant variability in both starting level and rate of change, motivating the use of random intercepts and random slopes. The MAR dropout pattern identified in Section 1 motivated the use of linear mixed models, which provide valid inference under MAR through likelihood-based estimation. This was preferred over Generalised Estimating Equations (GEEs), which require the stricter MCAR assumption and estimate population-average rather than subject-specific effects. <br> <br> **Model 1: Random intercept only** — each child has their own baseline but all decline at the same rate.
+
+```{r m1, results = 'hide'}
+m1 <- lmer(LivingBarriers ~ Visit + age_c + Gender + (1 | ID), data = data)
+summary(m1)
+```
+
+<br> Age at entry and gender were included as fixed effects as potential confounders. The average barriers for a male child of average age is 50.5 at visit 1, declining by 3.9 points per visit. Each additional year of age at entry is associated with 4.0 fewer barriers, and females and gender diverse participants report 2.3 and 2.9 fewer barriers respectively. The random intercept SD (9.02) is large relative to the residual SD (5.23), indicating substantial between-child variation. However, this model assumes all children decline at the same rate but looking at Figure 1 above it suggests otherwise. <br> <br> **Model 2: Random intercept + random slope** — each child has their own rate of change too.
+
+```{r m2-gender, results = 'hide'}
+m2_gender <- lmer(LivingBarriers ~ Visit + age_c + Gender + (Visit | ID), data = data)
+summary(m2_gender)
+AIC(m1, m2_gender)
+BIC(m1, m2_gender)
+```
+
+<br> Both AIC and BIC favour m2 (AIC: 353,731 vs 412,908; BIC: 353,812 vs 412,971). The random intercept SD has dropped from 9.02 to 2.61 as much of what m1 attributed to differences in starting level is actually explained by children having different rates of change. The random slope SD (2.90) means most children improve, but some barely change or even get slightly worse. The residual variance drops from 27.3 to 6.8, meaning the random slope captures substantial within child variation. The positive correlation of 0.28 between intercept and slope suggests children with higher initial barriers tend to decline faster. Gender is no longer significant once the random slope is included (t ≈ 1) and was dropped from subsequent models. Age at entry remains strongly significant (β = -3.41). <br> <br>
+
+```{r m2, include = 'FALSE'}
+# refit without gender
+m2 <- lmer(LivingBarriers ~ Visit + age_c + (Visit | ID), data = data)
+summary(m2)
+```
+
+**Model 3 & 4: Checking for Region**
+
+```{r region, results = 'hide'}
+# testing if region has any impact
+m3 <- lmer(LivingBarriers ~ Visit + age_c + Region + (Visit | ID), data = data)
+m4 <- lmer(LivingBarriers ~ Visit * Region + age_c + (Visit | ID), data = data)
+AIC(m2, m3, m4)
+BIC(m2, m3, m4)
+```
+
+<br> Region was tested as a fixed effect to assess whether sites differ in their average barrier level (m3) or rate of change (m4: Region × Visit interaction). Neither improved model fit (AIC: m2 = 353,723, m3 = 353,731, m4 = 353,741; BIC supports). The trajectory of barriers is consistent across all three sites. <br> <br> **Model 5: Quadratic time effect** — the mean trajectory appeared to flatten at later visits.
+
+```{r quadratic, results = 'hide'}
+data$Visit2 <- data$Visit^2
+# ML for comparing models with different fixed effects
+m2_ml <- lmer(LivingBarriers ~ Visit + age_c + (Visit | ID), data = data, REML = FALSE)
+m5_ml <- lmer(LivingBarriers ~ Visit + Visit2 + age_c + (Visit | ID), data = data, REML = FALSE)
+AIC(m2_ml, m5_ml)
+BIC(m2_ml, m5_ml)
+anova(m2_ml, m5_ml)
+```
+
+<br> The mean trajectory suggested a non-linear decline, so a quadratic term was added. Models were compared using maximum likelihood (REML is only appropriate for the same fixed effects) and the quadratic model is strongly preferred (AIC: 351,978 vs 353,707; likelihood ratio test: χ² = 1731.1, df = 1, p \< 2.2 × 10⁻¹⁶). The final model (m5) includes Visit, Visit², and centred age at entry as fixed effects, with random intercepts and slopes per child. Barriers for a child of average age begin at 47.7 (95% CI: 47.6, 47.8), declining by 2.7 points per year initially (95% CI: -2.8, -2.7), with the rate slowing over time (β₂ = -0.21, 95% CI: -0.22, -0.20). Each additional year of age at entry is associated with 3.0 fewer barriers (95% CI: -3.1, -2.9). Between-child differences account for 71.7% of total variance, indicating the model captures individual trajectories well.<br>
+
+```{r variance-partition, include = FALSE}
+# refit with REML for unbiased variance estimation
+m5 <- lmer(LivingBarriers ~ Visit + Visit2 + age_c + (Visit | ID), data = data)
+summary(m5)
+
+# how much variation is between children vs within?
+vc <- as.data.frame(VarCorr(m5))
+between_var <- vc$vcov[1] + vc$vcov[2]  # intercept + slope variance
+
+resid_var <- vc$vcov[4]  # residual (row 3 is covariance)
+total_var <- between_var + resid_var
+cat("Between-child variance:", round(between_var/total_var * 100, 1), "%\n")
+cat("Residual variance:", round(resid_var/total_var * 100, 1), "%\n")
+
+confint(m5, method = "Wald")
+```
+
+```{r diagnostics, echo = FALSE}
+qqnorm(resid(m5))
+qqline(resid(m5))
+```
+
+<center><b>Figure 2: QQ plot of residuals from the quadratic random slope model (m5).</b></center>
+
+<br> The QQ plot shows approximate normality with minor deviations in the tails. Residuals versus fitted values were also checked and displayed no systematic pattern.
+
+```{r sensitivity, include = FALSE}
+data_v1_4 <- data %>% filter(Visit <= 4)
+data_v1_4$Visit2 <- data_v1_4$Visit^2
+m5_v14 <- lmer(LivingBarriers ~ Visit + Visit2 + age_c + (Visit | ID), 
+               data = data_v1_4, REML = TRUE)
+cbind(Full = fixef(m5), V1to4 = fixef(m5_v14))
+```
+
+For a sensitivity analysis, the model was refitted using only visits 1 to 4, where all 12,338 participants are observed and no missing data assumptions are required. The fixed effect estimates were closely comparable (visit: −2.61 vs −2.75; age: −2.95 vs −3.01), supporting the plausibility of the MAR assumption. <br> <br>
+
+```{r blup-plot, echo = FALSE}
+blup_ids <- sample(unique(data$ID), 20)
+blup_data <- data %>% filter(ID %in% blup_ids)
+blup_data$pred <- predict(m5, newdata = blup_data)
+blup_data$Child <- factor(paste("Child", as.numeric(factor(blup_data$ID))),
+                          levels = paste("Child", 1:20))
+
+
+ggplot(blup_data, aes(x = Visit)) +
+  geom_point(aes(y = LivingBarriers)) +
+  geom_line(aes(y = pred), colour = "red") +
+  facet_wrap(~Child) +
+  scale_x_continuous(breaks = 1:7) +
+  labs(y = "Living Barriers Score", x = "Visit")
+```
+
+<center><b>Figure 3: Observed values (points) and child specific predicted trajectories (red) for 20 randomly sampled children</b></center>
+
+<br>
+
+The model captures a range of individual patterns through the random effects from children with minimal change to those with steep declines. Overall, barriers to childhood living decline significantly over the course of standard care. The decline is non-linear, steeper in the early years and slowing over time. For a child of average age at entry, barriers start at approximately 47.7 and drop by about 2.7 points per year initially, with the rate of decline reducing at each subsequent visit. Older children at entry tend to report fewer barriers throughout.
+
+There is substantial heterogeneity between children as some improve rapidly while others show little change, captured by the random intercepts and slopes in the model. The pattern is consistent across all three study sites. A key limitation is the reliance on the MAR assumption, though the sensitivity analysis above suggests this is plausible. If dropout is instead related to unobserved outcomes (MNAR), the estimated trajectories may underestimate the true rate of decline. Also, LivingBarriers is self-reported and may be subject to reporting bias. Gender was explored but found not to be significant once individual trajectories were accounted for.
+
+<br>
+
+## 3. RQ2: Do biomarkers identify subgroups responding differently to standard care?
+
+The blood dataset contains 11 biomarkers measured at visits 1 and 3 across two arrays (tx: 6 markers, rg: 5 markers). As identified in Section 1, site C is missing tx181 and rg67 at both visits which is a structural, site-level pattern consistent with MCAR. To avoid excluding site C, imputation by chained equations (MICE) was used to retain all participants and biomarkers. Region was included as a predictor in the imputation model (but not imputed itself) since it determines the missingness pattern.
+<br>
+<br>
+```{r rq2-imputation, results='hide', message=FALSE, warning=FALSE}
+
+# seet up imputation methods
+imp_method <- make.method(bloods)
+imp_method["ID"] <- "" # don't impute id
+imp_method["Region"] <- "" # don't impute region
+
+# predictor matrix
+imp_pred <- make.predictorMatrix(bloods)
+imp_pred["ID", ] <- 0 # id not being imputed
+imp_pred[, "ID"] <- 0 # id not used as predictor for anything
+
+imp_pred["Region", ] <- 0 # region not being imputed but used as predictor for missing biomarkers
+
+set.seed(123) # to fix for future iterations 
+imp <- mice(bloods, m = 10, maxit = 20, method = imp_method, 
+            predictorMatrix = imp_pred, printFlag = FALSE)
+```
+<br>
+```{r rq2-imputation-check, include = FALSE}
+bloods_imp1 <- complete(imp, 1)
+summary(bloods_imp1$V1.tx181[bloods$Region == "C"])
+summary(bloods_imp1$V1.tx181[bloods$Region != "C"])
+```
+
+Predictive mean matching (PMM) was used to generate 10 multiply imputed datasets, each providing values for the 4 missing biomarker variables in site C. The imputed distributions closely matched the observed values from sites A and B (e.g., V1.tx181 mean: 32.94 imputed vs 32.97 observed), supporting the MCAR assumption.
+
+
+```{r rq2-cluster, warning=FALSE, include=FALSE}
+
+#honestly, I genuinely find the whole clustering methods way more complicated to implement than it initally looked in the lecture, and I've been struggeling with this part. 
+
+v1_cols <- grep("^V1\\.", names(bloods_imp1), value = TRUE) #selection only visit 1
+v1_bio <- bloods_imp1[, v1_cols]
+
+BIC_result <- mclust::mclustBIC(v1_bio) #bic selecting best number of clusters and covariance structure 
+summary(BIC_result)
+
+library(mclust)
+
+#fitting the winning model: 2 clusters, VVE covariance structure
+mc <- mclust::Mclust(v1_bio, G = 2, modelNames = "VVE")
+table(mc$classification)
+
+```
+
+To identify biomarker defined subgroups, clustering was performed on the 11 biomarkers measured at visit 1. K-means and model-based clustering (Gaussian mixture model, `mclust`) were both considered. However, Professor Kirk just hates K-means so let's not fight with watermills here. Model-based clustering was preferred as it simultaneously selects the number of clusters and the covariance structure via BIC, allowing clusters to differ in size and shape. Two subgroups were identified: 6,004 and 6,334 children.
+
+
+```{r rq2-pca, include=FALSE}
+# PCA to reduce 11 biomarkers to 2 dimensions 
+
+pca <- prcomp(v1_bio, scale. = TRUE) #all biomarkers are equal
+
+# merging the first two PC scores with cluster labels for plotting
+pca_df <- data.frame(
+  PC1 = pca$x[,1], # first principal component score per child
+  PC2 = pca$x[,2], # second principal component score per child
+  Cluster = factor(mc$classification)  # cluster notification from mclust
+)
+
+summary(pca)$importance[, 1:2]
+```
+
+```{r fig4-pca, echo=FALSE}
+ggplot(pca_df, aes(x = PC1, y = PC2, colour = Cluster)) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  theme_minimal() +
+  labs(x = "PC1 (22.4%)", y = "PC2 (17.6%)", colour = "Biomarker\nCluster")
+```
+<br><center><b>Figure 4: PCA of visit 1 biomarkers coloured by cluster classification</b></center><br>
+
+PCA was used to visualise the clusters in reduced dimensions. The first two components explain 40% of the total variance — PC1 (22.4%) is driven by the tx array markers (tx9, tx165, tx166, tx83), while PC2 (17.6%) captures a contrast within the rg array. 
+
+The two groups are not quite sharply separated as we would hope for, reflecting gradual rather than discrete differences in biomarker profiles. Neverthless, the cluster classification was added to the mixed model from RQ1 to test whether these groups respond differently to standard care.
+
+```{r rq2-model, include=FALSE}
+# add cluster membership to the longitudinal data
+cluster_df <- data.frame(
+  ID = bloods_imp1$ID,
+  Cluster = factor(mc$classification)
+)
+data_clust <- merge(data, cluster_df, by = "ID")
+```
+<br>
+
+ **Mixed model with cluster interactions**
+```{r rq2-model_m_clust, results='hide'}
+# fit mixed model with cluster interactions
+m_clust <- lmer(LivingBarriers ~ Visit * Cluster + Visit2 * Cluster + age_c + 
+                  (Visit | ID), data = data_clust, REML = TRUE)
+
+summary(m_clust)
+```
+<br>Both interaction terms were significant: cluster 2 children began with fewer barriers (−0.79, t = −8.0) and showed a steeper decline over time (visit × cluster: −0.56, t = −7.1; visit² × cluster: −0.06, t = −6.1).
+<br>
+
+```{r fig5-trajectories, echo=FALSE}
+pred_data <- expand.grid(Visit = seq(1, 7, by = 0.1), Cluster = factor(1:2), age_c = 0)
+pred_data$Visit2 <- pred_data$Visit^2
+pred_data$predicted <- predict(m_clust, newdata = pred_data, re.form = NA)
+
+ggplot(pred_data, aes(x = Visit, y = predicted, colour = Cluster)) +
+  geom_line(linewidth = 1.2) +
+  labs(x = "Visit", y = "LivingBarriers", colour = "Biomarker\nCluster") +
+  theme_minimal()
+```
+
+<center><b>Figure 5: Predicted LivingBarriers trajectories by biomarker cluster for a child of average age at entry</b></center>
+
+<br>
+Both interaction terms were significant: cluster 2 children began with fewer barriers (−0.79, t = −8.0) and showed a steeper decline over time (visit × cluster: −0.56, t = −7.1; visut² × cluster: −0.06, t = −6.1). By visit 7, the predicted gap between clusters had widened from approximately 1 point to over 8 points.
+
+Biomarker defined subgroups thus provide evidence that children with different biological profiles at visit 1 respond differently to standard care. Cluster 2 is characterised by higher tx9 and tx166 which shows both lower initial barriers and a faster rate of improvement, suggesting these markers may have value in identifying children likely to benefit most from standard care.
+
+Several limitations have to be noted. The clusters overlap substantially, reflecting gradual shifts in biomarker levels rather than discrete biological subtypes. Clustering was performed on a single completed dataset, and while Rubin's rules allow pooling of model estimates across imputations, there is no standard method for pooling cluster tasks, and results showed some sensitivity to the imputed values used. The rg array contains 5 rather than the documented 6 biomarkers, suggesting one variable was not collected and cannot be recovered. Finally, the causal direction is unclear as the biomarker differences may reflect underlying health status rather than directly influencing response to care.
+
+
+Number of words: 1584
+
+AI Statement: LLM was used to refine and tighten sentences in my draft to meet the word limit. 
